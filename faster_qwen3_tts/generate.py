@@ -29,6 +29,7 @@ def fast_generate(
     top_p: float = 1.0,
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
+    speed: float = 1.0,
     subtalker_dosample: Optional[bool] = None,
     subtalker_top_k: Optional[int] = None,
     subtalker_top_p: Optional[float] = None,
@@ -145,42 +146,54 @@ def fast_generate(
     # === DECODE LOOP ===
     t_decode_start = time.time()
     all_codec_ids = []
-    
+    text_cursor = 0.0  # float cursor for speed-controlled text advancement
+    initial_gen_step = gen_step  # remember initial position from prefill
+    text_len = trailing_text_hiddens.shape[1]
+
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
             break
-        
+
         # --- CUDA-Graphed Code Predictor ---
         last_id_hidden = talker_codec_embed(token.unsqueeze(1))  # [1, 1, H]
         pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)  # [1, 2, H]
         codebook_token_ids = predictor_graph.run(pred_input)  # [15] long tensor
-        
+
         # Build full codec: [first_cb, cb1, ..., cb15]
         all_cb = torch.cat([token.view(1), codebook_token_ids])  # [16]
         all_codec_ids.append(all_cb.detach())
-        
+
         # --- Build input embedding for talker ---
         codec_hiddens = [last_id_hidden]
         for i in range(num_code_groups - 1):
             codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
         inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
-        
-        if gen_step < trailing_text_hiddens.shape[1]:
-            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
+
+        # Speed-controlled text conditioning: interpolate trailing_text_hiddens
+        effective_step = initial_gen_step + text_cursor
+        idx = int(effective_step)
+        if idx < text_len:
+            frac = effective_step - idx
+            if frac > 0 and idx + 1 < text_len:
+                text_hidden = ((1.0 - frac) * trailing_text_hiddens[:, idx]
+                               + frac * trailing_text_hiddens[:, idx + 1])
+            else:
+                text_hidden = trailing_text_hiddens[:, min(idx, text_len - 1)]
+            inputs_embeds = inputs_embeds + text_hidden.unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
-        
+
         # --- CUDA-Graphed Talker decode step ---
         current_pos = prefill_len + step_idx
         if current_pos >= talker_graph.max_seq_len - 1:
             # Stop if we exceed max_seq_len
             break
-        
+
         hidden_states = talker_graph.run(inputs_embeds, position=current_pos)
         # hidden_states is the static output buffer - use it immediately
-        
+
         logits = talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
-        
+
         if repetition_penalty != 1.0 and len(all_codec_ids) > 0:
             history = torch.stack([c[0] for c in all_codec_ids])
             logits = apply_repetition_penalty(logits, history, repetition_penalty)
@@ -196,7 +209,7 @@ def fast_generate(
             suppress_tokens=[eos_id] if suppress_eos else None,
         )
         past_hidden = hidden_states[:, -1:, :].clone()  # clone since it's the static buffer
-        gen_step += 1
+        text_cursor += speed  # speed=1.0 → normal, speed=1.5 → text advances 50% faster
     
     torch.cuda.synchronize()
     t_decode = time.time() - t_decode_start

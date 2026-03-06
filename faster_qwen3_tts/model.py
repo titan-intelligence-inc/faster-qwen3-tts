@@ -536,6 +536,7 @@ class FasterQwen3TTS:
         top_p: float = 1.0,
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
+        speed: float = 1.0,
         xvec_only: bool = True,
         non_streaming_mode: bool = True,
         append_silence: bool = True,
@@ -555,6 +556,8 @@ class FasterQwen3TTS:
             top_p: Top-p (nucleus) sampling
             do_sample: Whether to sample
             repetition_penalty: Repetition penalty
+            speed: Text conditioning speed (1.0 = normal, >1.0 = faster, <1.0 = slower).
+                Controls how fast the model advances through text embeddings.
             xvec_only: When True (default), use only the speaker embedding for voice cloning.
                 This prevents phoneme bleed-through from the reference and allows clean
                 language switching. Set to False for full ICL mode (reference audio in context).
@@ -591,6 +594,7 @@ class FasterQwen3TTS:
             top_p=top_p,
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
+            speed=speed,
         )
 
         if codec_ids is None:
@@ -648,6 +652,7 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
+        speed: float = 1.0,
         xvec_only: bool = True,
         non_streaming_mode: bool = True,
         append_silence: bool = True,
@@ -672,6 +677,8 @@ class FasterQwen3TTS:
             do_sample: Whether to sample
             repetition_penalty: Repetition penalty
             chunk_size: Codec steps per chunk (12 = ~1 second)
+            speed: Text conditioning speed (1.0 = normal, >1.0 = faster, <1.0 = slower).
+                Controls how fast the model advances through text embeddings.
             xvec_only: When True (default), use only the speaker embedding for voice cloning.
                 This prevents phoneme bleed-through from the reference and allows clean
                 language switching. Set to False for full ICL mode (reference audio in context).
@@ -724,6 +731,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
         )
         if not parity_mode:
+            stream_kwargs["speed"] = speed
             stream_kwargs["predictor_graph"] = self.predictor_graph
             stream_kwargs["talker_graph"] = self.talker_graph
 

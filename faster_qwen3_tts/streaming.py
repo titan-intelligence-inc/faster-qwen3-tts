@@ -33,6 +33,7 @@ def fast_generate_streaming(
     do_sample: bool = True,
     repetition_penalty: float = 1.05,
     chunk_size: int = 12,
+    speed: float = 1.0,
 ) -> Generator[Tuple[torch.Tensor, dict], None, None]:
     """
     Streaming autoregressive generation with CUDA-graphed predictor and talker.
@@ -102,6 +103,9 @@ def fast_generate_streaming(
     total_steps = 0
     chunk_count = 0
     chunk_start = time.time()
+    text_cursor = 0.0  # float cursor for speed-controlled text advancement
+    initial_gen_step = gen_step
+    text_len = trailing_text_hiddens.shape[1]
 
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
@@ -122,8 +126,17 @@ def fast_generate_streaming(
             codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
         inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
 
-        if gen_step < trailing_text_hiddens.shape[1]:
-            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
+        # Speed-controlled text conditioning: interpolate trailing_text_hiddens
+        effective_step = initial_gen_step + text_cursor
+        idx = int(effective_step)
+        if idx < text_len:
+            frac = effective_step - idx
+            if frac > 0 and idx + 1 < text_len:
+                text_hidden = ((1.0 - frac) * trailing_text_hiddens[:, idx]
+                               + frac * trailing_text_hiddens[:, idx + 1])
+            else:
+                text_hidden = trailing_text_hiddens[:, min(idx, text_len - 1)]
+            inputs_embeds = inputs_embeds + text_hidden.unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
 
@@ -151,7 +164,7 @@ def fast_generate_streaming(
             suppress_tokens=[eos_id] if suppress_eos else None,
         )
         past_hidden = hidden_states[:, -1:, :].clone()
-        gen_step += 1
+        text_cursor += speed  # speed=1.0 → normal, speed=1.5 → text advances 50% faster
 
         # --- Yield chunk when buffer is full ---
         if len(chunk_buffer) >= chunk_size:
