@@ -585,8 +585,31 @@ class FasterQwen3TTS:
 
         # Compute speed from duration if specified
         effective_speed = 1.0
+        needs_speed_control = False
         if duration is not None and speed is not None:
             raise ValueError("Cannot specify both speed and duration")
+        if duration is not None:
+            needs_speed_control = True
+        elif speed is not None and speed != 1.0:
+            needs_speed_control = True
+            effective_speed = speed
+
+        # Speed/duration control requires non_streaming_mode=False so that
+        # trailing_text_hiddens contains actual text embeddings (not just padding).
+        if needs_speed_control and non_streaming_mode:
+            logger.info(
+                "Speed/duration control requires non_streaming_mode=False; overriding."
+            )
+            m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
+                text,
+                ref_audio,
+                ref_text,
+                language=language,
+                xvec_only=xvec_only,
+                non_streaming_mode=False,
+                append_silence=append_silence,
+            )
+
         if duration is not None:
             target_tokens = duration * 12.0  # 12 Hz codec
             text_len = tth.shape[1]
@@ -596,8 +619,6 @@ class FasterQwen3TTS:
                     "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
                     duration, int(target_tokens), text_len, effective_speed,
                 )
-        elif speed is not None:
-            effective_speed = speed
 
         codec_ids, timing = fast_generate(
             talker=talker,
@@ -716,20 +737,35 @@ class FasterQwen3TTS:
         """
         from .streaming import fast_generate_streaming, parity_generate_streaming
 
+        # Compute speed from duration if specified
+        effective_speed = 1.0
+        needs_speed_control = False
+        if duration is not None and speed is not None:
+            raise ValueError("Cannot specify both speed and duration")
+        if duration is not None:
+            needs_speed_control = True
+        elif speed is not None and speed != 1.0:
+            needs_speed_control = True
+            effective_speed = speed
+
+        # Speed/duration control requires non_streaming_mode=False
+        actual_non_streaming = non_streaming_mode
+        if needs_speed_control and non_streaming_mode:
+            logger.info(
+                "Speed/duration control requires non_streaming_mode=False; overriding."
+            )
+            actual_non_streaming = False
+
         m, talker, config, tie, tam, tth, tpe, ref_codes = self._prepare_generation(
             text,
             ref_audio,
             ref_text,
             language=language,
             xvec_only=xvec_only,
-            non_streaming_mode=non_streaming_mode,
+            non_streaming_mode=actual_non_streaming,
             append_silence=append_silence,
         )
 
-        # Compute speed from duration if specified
-        effective_speed = 1.0
-        if duration is not None and speed is not None:
-            raise ValueError("Cannot specify both speed and duration")
         if duration is not None:
             target_tokens = duration * 12.0
             text_len = tth.shape[1]
@@ -739,8 +775,6 @@ class FasterQwen3TTS:
                     "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
                     duration, int(target_tokens), text_len, effective_speed,
                 )
-        elif speed is not None:
-            effective_speed = speed
 
         speech_tokenizer = m.speech_tokenizer
 
