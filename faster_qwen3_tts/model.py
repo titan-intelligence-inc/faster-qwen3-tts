@@ -614,10 +614,15 @@ class FasterQwen3TTS:
             target_tokens = duration * 12.0  # 12 Hz codec
             text_len = tth.shape[1]
             if target_tokens > 0 and text_len > 0:
-                effective_speed = text_len / target_tokens
+                # Estimate natural codec token count from text length.
+                # Empirically, each text token produces ~3 codec tokens at speed=1.0.
+                estimated_natural_tokens = text_len * 3.0
+                effective_speed = estimated_natural_tokens / target_tokens
                 logger.info(
-                    "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
-                    duration, int(target_tokens), text_len, effective_speed,
+                    "Duration %.2fs → target %d tokens, text_len %d, "
+                    "est_natural %d → speed %.3f",
+                    duration, int(target_tokens), text_len,
+                    int(estimated_natural_tokens), effective_speed,
                 )
 
         codec_ids, timing = fast_generate(
@@ -770,10 +775,13 @@ class FasterQwen3TTS:
             target_tokens = duration * 12.0
             text_len = tth.shape[1]
             if target_tokens > 0 and text_len > 0:
-                effective_speed = text_len / target_tokens
+                estimated_natural_tokens = text_len * 3.0
+                effective_speed = estimated_natural_tokens / target_tokens
                 logger.info(
-                    "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
-                    duration, int(target_tokens), text_len, effective_speed,
+                    "Duration %.2fs → target %d tokens, text_len %d, "
+                    "est_natural %d → speed %.3f",
+                    duration, int(target_tokens), text_len,
+                    int(estimated_natural_tokens), effective_speed,
                 )
 
         speech_tokenizer = m.speech_tokenizer
