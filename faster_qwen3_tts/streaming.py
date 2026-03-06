@@ -153,12 +153,13 @@ def fast_generate_streaming(
             history = torch.stack(all_first_tokens)
             logits = apply_repetition_penalty(logits, history, repetition_penalty)
 
-        # When speed > 1.0, text is consumed faster. Once all text is consumed,
+        # When speed != 1.0, once all text embeddings are consumed,
         # boost EOS logit to encourage the model to stop promptly.
         if speed != 1.0 and idx >= text_len:
-            text_overshoot = (idx - text_len) / max(text_len, 1)
-            eos_bias = min(10.0, 5.0 + text_overshoot * 20.0)
-            logits[:, :, eos_id] += eos_bias
+            steps_past = step_idx - int((text_len - initial_gen_step) / speed)
+            if steps_past > 0:
+                eos_bias = min(10.0, 3.0 + steps_past * 1.0)
+                logits[:, :, eos_id] += eos_bias
 
         suppress_eos = len(all_first_tokens) < min_new_tokens
         token = sample_logits(
