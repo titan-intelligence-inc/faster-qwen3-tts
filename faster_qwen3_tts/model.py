@@ -536,7 +536,8 @@ class FasterQwen3TTS:
         top_p: float = 1.0,
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
-        speed: float = 1.0,
+        speed: Optional[float] = None,
+        duration: Optional[float] = None,
         xvec_only: bool = True,
         non_streaming_mode: bool = True,
         append_silence: bool = True,
@@ -558,6 +559,10 @@ class FasterQwen3TTS:
             repetition_penalty: Repetition penalty
             speed: Text conditioning speed (1.0 = normal, >1.0 = faster, <1.0 = slower).
                 Controls how fast the model advances through text embeddings.
+                Mutually exclusive with duration.
+            duration: Target audio duration in seconds. Automatically computes
+                speed to produce approximately this length of audio.
+                Mutually exclusive with speed.
             xvec_only: When True (default), use only the speaker embedding for voice cloning.
                 This prevents phoneme bleed-through from the reference and allows clean
                 language switching. Set to False for full ICL mode (reference audio in context).
@@ -578,6 +583,22 @@ class FasterQwen3TTS:
             append_silence=append_silence,
         )
 
+        # Compute speed from duration if specified
+        effective_speed = 1.0
+        if duration is not None and speed is not None:
+            raise ValueError("Cannot specify both speed and duration")
+        if duration is not None:
+            target_tokens = duration * 12.0  # 12 Hz codec
+            text_len = tth.shape[1]
+            if target_tokens > 0 and text_len > 0:
+                effective_speed = text_len / target_tokens
+                logger.info(
+                    "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
+                    duration, int(target_tokens), text_len, effective_speed,
+                )
+        elif speed is not None:
+            effective_speed = speed
+
         codec_ids, timing = fast_generate(
             talker=talker,
             talker_input_embeds=tie,
@@ -594,7 +615,7 @@ class FasterQwen3TTS:
             top_p=top_p,
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
-            speed=speed,
+            speed=effective_speed,
         )
 
         if codec_ids is None:
@@ -652,7 +673,8 @@ class FasterQwen3TTS:
         do_sample: bool = True,
         repetition_penalty: float = 1.05,
         chunk_size: int = 12,
-        speed: float = 1.0,
+        speed: Optional[float] = None,
+        duration: Optional[float] = None,
         xvec_only: bool = True,
         non_streaming_mode: bool = True,
         append_silence: bool = True,
@@ -678,7 +700,10 @@ class FasterQwen3TTS:
             repetition_penalty: Repetition penalty
             chunk_size: Codec steps per chunk (12 = ~1 second)
             speed: Text conditioning speed (1.0 = normal, >1.0 = faster, <1.0 = slower).
-                Controls how fast the model advances through text embeddings.
+                Mutually exclusive with duration.
+            duration: Target audio duration in seconds. Automatically computes
+                speed to produce approximately this length of audio.
+                Mutually exclusive with speed.
             xvec_only: When True (default), use only the speaker embedding for voice cloning.
                 This prevents phoneme bleed-through from the reference and allows clean
                 language switching. Set to False for full ICL mode (reference audio in context).
@@ -700,6 +725,22 @@ class FasterQwen3TTS:
             non_streaming_mode=non_streaming_mode,
             append_silence=append_silence,
         )
+
+        # Compute speed from duration if specified
+        effective_speed = 1.0
+        if duration is not None and speed is not None:
+            raise ValueError("Cannot specify both speed and duration")
+        if duration is not None:
+            target_tokens = duration * 12.0
+            text_len = tth.shape[1]
+            if target_tokens > 0 and text_len > 0:
+                effective_speed = text_len / target_tokens
+                logger.info(
+                    "Duration %.2fs → target %d tokens, text_len %d → speed %.3f",
+                    duration, int(target_tokens), text_len, effective_speed,
+                )
+        elif speed is not None:
+            effective_speed = speed
 
         speech_tokenizer = m.speech_tokenizer
 
@@ -731,7 +772,7 @@ class FasterQwen3TTS:
             chunk_size=chunk_size,
         )
         if not parity_mode:
-            stream_kwargs["speed"] = speed
+            stream_kwargs["speed"] = effective_speed
             stream_kwargs["predictor_graph"] = self.predictor_graph
             stream_kwargs["talker_graph"] = self.talker_graph
 
