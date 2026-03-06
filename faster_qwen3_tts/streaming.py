@@ -9,6 +9,7 @@ import time
 from typing import Generator, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .predictor_graph import PredictorGraph
 from .sampling import apply_repetition_penalty, sample_logits
@@ -97,15 +98,21 @@ def fast_generate_streaming(
     torch.cuda.synchronize()
     t_prefill = time.time() - t_start
 
+    # === Pre-resample text embeddings for speed control ===
+    text_len = trailing_text_hiddens.shape[1]
+    if speed != 1.0 and text_len > 1:
+        new_len = max(1, round(text_len / speed))
+        tth_t = trailing_text_hiddens.permute(0, 2, 1)
+        tth_t = F.interpolate(tth_t, size=new_len, mode='linear', align_corners=True)
+        trailing_text_hiddens = tth_t.permute(0, 2, 1)
+        text_len = new_len
+
     # === DECODE LOOP — yield chunks ===
     chunk_buffer = []
     all_first_tokens = []  # for repetition penalty across chunks
     total_steps = 0
     chunk_count = 0
     chunk_start = time.time()
-    text_cursor = 0.0  # float cursor for speed-controlled text advancement
-    initial_gen_step = gen_step
-    text_len = trailing_text_hiddens.shape[1]
 
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
@@ -126,17 +133,8 @@ def fast_generate_streaming(
             codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
         inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
 
-        # Speed-controlled text conditioning: interpolate trailing_text_hiddens
-        effective_step = initial_gen_step + text_cursor
-        idx = int(effective_step)
-        if idx < text_len:
-            frac = effective_step - idx
-            if frac > 0 and idx + 1 < text_len:
-                text_hidden = ((1.0 - frac) * trailing_text_hiddens[:, idx]
-                               + frac * trailing_text_hiddens[:, idx + 1])
-            else:
-                text_hidden = trailing_text_hiddens[:, min(idx, text_len - 1)]
-            inputs_embeds = inputs_embeds + text_hidden.unsqueeze(1)
+        if gen_step < text_len:
+            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
 
@@ -153,12 +151,11 @@ def fast_generate_streaming(
             history = torch.stack(all_first_tokens)
             logits = apply_repetition_penalty(logits, history, repetition_penalty)
 
-        # When speed != 1.0, once all text embeddings are consumed,
-        # boost EOS logit to encourage the model to stop promptly.
-        if speed != 1.0 and idx >= text_len:
-            steps_past = step_idx - int((text_len - initial_gen_step) / speed)
-            if steps_past > 0:
-                eos_bias = min(10.0, 3.0 + steps_past * 1.0)
+        # When speed != 1.0 and text is exhausted, gently nudge model toward EOS
+        if speed != 1.0 and gen_step >= text_len:
+            steps_past = gen_step - text_len
+            if steps_past > 2:
+                eos_bias = min(10.0, 2.0 + steps_past * 0.5)
                 logits[:, :, eos_id] += eos_bias
 
         suppress_eos = len(all_first_tokens) < min_new_tokens
@@ -172,7 +169,7 @@ def fast_generate_streaming(
             suppress_tokens=[eos_id] if suppress_eos else None,
         )
         past_hidden = hidden_states[:, -1:, :].clone()
-        text_cursor += speed  # speed=1.0 → normal, speed=1.5 → text advances 50% faster
+        gen_step += 1
 
         # --- Yield chunk when buffer is full ---
         if len(chunk_buffer) >= chunk_size:
@@ -231,10 +228,6 @@ def parity_generate_streaming(
 
     Yields (codec_chunk, timing_info) tuples every chunk_size steps.
     """
-    # NOTE: This function intentionally mirrors fast_generate_streaming. The core
-    # decode loop is duplicated so we can swap CUDA graphs/static cache for the
-    # dynamic-cache path while keeping sampling/chunking identical. If you edit
-    # the fast path, check parity_generate_streaming for matching changes.
     eos_id = config.codec_eos_token_id
     vocab_size = config.vocab_size
     device = talker_input_embeds.device

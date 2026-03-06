@@ -6,6 +6,7 @@ import time
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
 from .predictor_graph import PredictorGraph
 from .sampling import apply_repetition_penalty, sample_logits
@@ -43,7 +44,7 @@ def fast_generate(
     num_code_groups = config.num_code_groups
     vocab_size = config.vocab_size
     device = talker_input_embeds.device
-    
+
     suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
     suppress_start = max(0, vocab_size - 1024)
     for i in range(suppress_start, vocab_size):
@@ -96,15 +97,15 @@ def fast_generate(
             'steps_per_s': (steps / total_time) if total_time > 0 else 0.0,
         }
         return talker_codes_list[0] if talker_codes_list else None, timing
-    
+
     predictor = talker.code_predictor
     talker_codec_embed = talker.get_input_embeddings()
     talker_codec_head = talker.codec_head
     predictor_codec_embeds = predictor.get_input_embeddings()
-    
+
     # === PREFILL (still uses HF forward for variable-length prefill) ===
     t_start = time.time()
-    
+
     out = talker.forward(
         inputs_embeds=talker_input_embeds,
         attention_mask=attention_mask,
@@ -117,11 +118,11 @@ def fast_generate(
         past_hidden=None,
         past_key_values=None,
     )
-    
+
     talker_past_kv = out.past_key_values
     past_hidden = out.past_hidden
     gen_step = out.generation_step
-    
+
     logits = out.logits[:, -1, :]
     suppress_eos = min_new_tokens > 0
     token = sample_logits(
@@ -133,22 +134,31 @@ def fast_generate(
         suppress_mask=suppress_mask,
         suppress_tokens=[eos_id] if suppress_eos else None,
     )
-    
+
     # Copy prefill KV cache into talker graph's static cache
     prefill_len = talker_graph.prefill_kv(talker_past_kv)
     # Sync padding mask + rope deltas for decode parity
     rope_deltas = getattr(talker, "rope_deltas", None)
     talker_graph.set_generation_state(attention_mask, rope_deltas)
-    
+
     torch.cuda.synchronize()
     t_prefill = time.time() - t_start
-    
+
+    # === Pre-resample text embeddings for speed control ===
+    # Stretch/compress the text sequence BEFORE decoding so the model
+    # always advances gen_step by 1 (as trained). Only the text sequence
+    # content changes, not the decode pacing.
+    text_len = trailing_text_hiddens.shape[1]
+    if speed != 1.0 and text_len > 1:
+        new_len = max(1, round(text_len / speed))
+        tth_t = trailing_text_hiddens.permute(0, 2, 1)  # [B, H, T]
+        tth_t = F.interpolate(tth_t, size=new_len, mode='linear', align_corners=True)
+        trailing_text_hiddens = tth_t.permute(0, 2, 1)  # [B, T_new, H]
+        text_len = new_len
+
     # === DECODE LOOP ===
     t_decode_start = time.time()
     all_codec_ids = []
-    text_cursor = 0.0  # float cursor for speed-controlled text advancement
-    initial_gen_step = gen_step  # remember initial position from prefill
-    text_len = trailing_text_hiddens.shape[1]
 
     for step_idx in range(max_new_tokens):
         if token.item() == eos_id:
@@ -169,17 +179,8 @@ def fast_generate(
             codec_hiddens.append(predictor_codec_embeds[i](codebook_token_ids[i].unsqueeze(0).unsqueeze(0)))
         inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
 
-        # Speed-controlled text conditioning: interpolate trailing_text_hiddens
-        effective_step = initial_gen_step + text_cursor
-        idx = int(effective_step)
-        if idx < text_len:
-            frac = effective_step - idx
-            if frac > 0 and idx + 1 < text_len:
-                text_hidden = ((1.0 - frac) * trailing_text_hiddens[:, idx]
-                               + frac * trailing_text_hiddens[:, idx + 1])
-            else:
-                text_hidden = trailing_text_hiddens[:, min(idx, text_len - 1)]
-            inputs_embeds = inputs_embeds + text_hidden.unsqueeze(1)
+        if gen_step < text_len:
+            inputs_embeds = inputs_embeds + trailing_text_hiddens[:, gen_step].unsqueeze(1)
         else:
             inputs_embeds = inputs_embeds + tts_pad_embed
 
@@ -198,13 +199,11 @@ def fast_generate(
             history = torch.stack([c[0] for c in all_codec_ids])
             logits = apply_repetition_penalty(logits, history, repetition_penalty)
 
-        # When speed != 1.0, once all text embeddings are consumed,
-        # boost EOS logit to encourage the model to stop promptly.
-        if speed != 1.0 and idx >= text_len:
-            # How many steps past the text boundary
-            steps_past = step_idx - int((text_len - initial_gen_step) / speed)
-            if steps_past > 0:
-                eos_bias = min(10.0, 3.0 + steps_past * 1.0)
+        # When speed != 1.0 and text is exhausted, gently nudge model toward EOS
+        if speed != 1.0 and gen_step >= text_len:
+            steps_past = gen_step - text_len
+            if steps_past > 2:
+                eos_bias = min(10.0, 2.0 + steps_past * 0.5)
                 logits[:, :, eos_id] += eos_bias
 
         suppress_eos = len(all_codec_ids) < min_new_tokens
@@ -218,11 +217,11 @@ def fast_generate(
             suppress_tokens=[eos_id] if suppress_eos else None,
         )
         past_hidden = hidden_states[:, -1:, :].clone()  # clone since it's the static buffer
-        text_cursor += speed  # speed=1.0 → normal, speed=1.5 → text advances 50% faster
-    
+        gen_step += 1
+
     torch.cuda.synchronize()
     t_decode = time.time() - t_decode_start
-    
+
     n_steps = len(all_codec_ids)
     timing = {
         'prefill_ms': t_prefill * 1000,
@@ -231,7 +230,7 @@ def fast_generate(
         'ms_per_step': (t_decode / n_steps * 1000) if n_steps > 0 else 0,
         'steps_per_s': (n_steps / t_decode) if t_decode > 0 else 0,
     }
-    
+
     if all_codec_ids:
         return torch.stack(all_codec_ids), timing
     return None, timing
