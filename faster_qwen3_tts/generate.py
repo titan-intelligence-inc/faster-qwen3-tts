@@ -198,6 +198,13 @@ def fast_generate(
             history = torch.stack([c[0] for c in all_codec_ids])
             logits = apply_repetition_penalty(logits, history, repetition_penalty)
 
+        # When speed > 1.0, text is consumed faster. Once all text is consumed,
+        # boost EOS logit to encourage the model to stop promptly.
+        if speed != 1.0 and idx >= text_len:
+            text_overshoot = (idx - text_len) / max(text_len, 1)
+            eos_bias = min(10.0, 5.0 + text_overshoot * 20.0)
+            logits[:, :, eos_id] += eos_bias
+
         suppress_eos = len(all_codec_ids) < min_new_tokens
         token = sample_logits(
             logits.squeeze(0),
